@@ -275,15 +275,20 @@ fn external_root_for(canonical_project: &Path) -> Option<PathBuf> {
 
 /// Keep `project`'s index in `root` (an absolute directory outside the project)
 /// instead of `<project>/.codegraph`, for every later [`IndexPaths::resolve`] in
-/// this process. `root` is created. Fails if either path cannot be
+/// this process. `root`'s parent is created. Fails if either path cannot be
 /// canonicalized or `root` lies inside `project` (or is an ancestor of it).
 pub fn register_external_root(project: &Path, root: &Path) -> Result<PathBuf, IndexPathsError> {
     let canon = |path: &Path| {
         path.canonicalize().map_err(|source| IndexPathsError::Canonicalize { path: path.to_path_buf(), source })
     };
     let project = canon(project)?;
-    std::fs::create_dir_all(root).map_err(|source| IndexPathsError::Canonicalize { path: root.to_path_buf(), source })?;
-    let root = canon(root)?;
+    // Only the parent is created: the rebuild layer creates the root itself with
+    // its permanent lock, and refuses a root that exists without one.
+    let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+        return Err(IndexPathsError::RootAlias { path: root.to_path_buf(), reason: "no parent directory".to_string() });
+    };
+    std::fs::create_dir_all(parent).map_err(|source| IndexPathsError::Canonicalize { path: parent.to_path_buf(), source })?;
+    let root = canon(parent)?.join(name);
     if root.starts_with(&project) || project.starts_with(&root) {
         return Err(IndexPathsError::RootAlias {
             path: root,
