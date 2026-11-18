@@ -749,7 +749,7 @@ impl Store {
 
     /// Fold the write-ahead log back into the main database file and truncate the
     /// `-wal` sidecar. Used by the rebuild finalizer to make the extraction stamp
-    /// durable in the main file that `Current` corroboration deserializes.
+    /// durable in the main file that `Current` corroboration reads in place.
     pub(crate) fn checkpoint_wal_truncate(&self) -> Result<()> {
         self.validate_state_write_authority()?;
         self.conn
@@ -919,12 +919,11 @@ fn corroborate_current_database_options(
 fn open_read_only_without_sidecars(db_path: &Path) -> Result<(Connection, Connection)> {
     // Opening an existing WAL-mode DB read-only is not enough to prevent SQLite
     // from creating `-wal`/`-shm` on the first query. Open the real path with
-    // exactly READ_ONLY/no-create flags, then deserialize the already-checkpointed
-    // main-DB bytes into a separate in-memory SQLite handle before executing SQL.
-    // SQLite therefore performs the stamp query over a READONLY deserialized
-    // image and never enters the file pager path that authors sidecars. The outer
-    // shared IndexLease keeps the authoritative DB stable for the Store's whole
-    // life, and the READ_ONLY source connection remains retained beside it.
+    // exactly READ_ONLY/no-create flags, then query the already-checkpointed
+    // main file through a second `immutable=1` handle, which never takes locks
+    // or authors sidecars. The outer shared IndexLease keeps the authoritative
+    // DB stable for the Store's whole life, and the READ_ONLY source connection
+    // remains retained beside it.
     // Open the existing path with the required READ_ONLY/no-create flags before
     // constructing the sidecar-free query handle. This validates SQLite's own
     // file-open contract without executing a pager query that could create WAL
@@ -935,133 +934,33 @@ fn open_read_only_without_sidecars(db_path: &Path) -> Result<(Connection, Connec
             path: db_path.to_path_buf(),
             source,
         })?;
-    // The main file is read once, straight into the buffer SQLite takes over
-    // (W5-09f): a copy through a `Vec` doubled the cost of every open.
-    let image = read_database_image(db_path).map_err(|source| StoreError::ReadDatabase {
-        path: db_path.to_path_buf(),
-        source,
-    })?;
-    let mut conn = Connection::open_in_memory().map_err(|source| StoreError::Open {
-        path: db_path.to_path_buf(),
-        source,
-    })?;
-    deserialize_read_only(&mut conn, image).map_err(|source| StoreError::Open {
+    // `immutable=1`: SQLite reads the main file in place, takes no locks and never
+    // authors `-wal`/`-shm`. That holds because the shared lease keeps every writer
+    // out for the Store's whole life. Deserializing the image instead copied the
+    // whole database on every open (300 MB per query on a large repository, and
+    // one copy per concurrent reader).
+    let conn = Connection::open_with_flags(
+        format!("file:{}?immutable=1", sqlite_uri_path(db_path)),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|source| StoreError::Open {
         path: db_path.to_path_buf(),
         source,
     })?;
     Ok((conn, source_conn))
 }
 
-/// A `sqlite3_malloc64` buffer holding a database image, freed on drop until
-/// [`Self::into_raw`] hands it to SQLite.
-struct SqliteImage {
-    allocation: std::ptr::NonNull<u8>,
-    len: usize,
-}
-
-impl SqliteImage {
-    fn bytes(&self) -> &[u8] {
-        // SAFETY: `allocation` is a live `len`-byte allocation this value owns.
-        unsafe { std::slice::from_raw_parts(self.allocation.as_ptr(), self.len) }
-    }
-
-    fn into_raw(self) -> *mut u8 {
-        // SQLite takes the buffer over: this value must not free it.
-        std::mem::ManuallyDrop::new(self).allocation.as_ptr()
-    }
-}
-
-impl Drop for SqliteImage {
-    fn drop(&mut self) {
-        // SAFETY: the buffer came from sqlite3_malloc64 and was never handed to
-        // SQLite (`into_raw` never drops the value).
-        unsafe { rusqlite::ffi::sqlite3_free(self.allocation.as_ptr().cast()) };
-    }
-}
-
-/// Read the main database file into a SQLite-owned buffer of its length, in
-/// one copy. A file that grows or shrinks while it is read fails the read, so
-/// no torn image reaches SQLite.
-fn read_database_image(db_path: &Path) -> std::io::Result<SqliteImage> {
-    let mut file = std::fs::File::open(db_path)?;
-    let len = usize::try_from(file.metadata()?.len())
-        .map_err(|_| std::io::Error::other("database larger than memory"))?;
-    read_image_of_len(&mut file, len)
-}
-
-/// [`read_database_image`] for a file whose length was read as `len`.
-fn read_image_of_len(file: &mut impl std::io::Read, len: usize) -> std::io::Result<SqliteImage> {
-    let size = u64::try_from(len.max(1)).map_err(|_| std::io::Error::other("database size"))?;
-    // SAFETY: a plain allocation of `size` bytes, owned by the returned image
-    // (or freed by its drop on every early return below).
-    let allocation = unsafe { rusqlite::ffi::sqlite3_malloc64(size) };
-    let allocation = std::ptr::NonNull::new(allocation.cast::<u8>())
-        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
-    let image = SqliteImage { allocation, len };
-    // SAFETY: the allocation holds at least `len` writable bytes.
-    let buffer = unsafe { std::slice::from_raw_parts_mut(image.allocation.as_ptr(), len) };
-    file.read_exact(buffer)?;
-    let mut past = [0u8; 1];
-    if file.read(&mut past)? != 0 {
-        return Err(std::io::Error::other("database changed while it was read"));
-    }
-    Ok(image)
-}
-
-fn deserialize_read_only(conn: &mut Connection, image: SqliteImage) -> rusqlite::Result<()> {
-    if image.len == 0 {
-        // An empty file fails as it did when its zero-byte copy could not be
-        // allocated.
-        return Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOMEM),
-            None,
-        ));
-    }
-    let (_, deserialize_size) = deserialize_sizes(image.len)?;
-    let bytes = image.bytes();
-    let normalize = bytes.len() >= 20 && bytes.starts_with(b"SQLite format 3\0");
-    let allocation = image.into_raw();
-    if normalize {
-        // A clean checkpointed WAL database still records WAL read/write format
-        // bytes (2) in its main-file header. The deserialized image has no WAL
-        // sidecar by design, so normalize only this private in-memory copy to
-        // rollback format (1) before SQLite reads it. Disk bytes remain exact.
-        // SAFETY: the allocation has `bytes.len() >= 20` writable bytes here.
-        unsafe {
-            allocation.add(18).write(1);
-            allocation.add(19).write(1);
+/// `path` as the path part of an SQLite `file:` URI.
+fn sqlite_uri_path(path: &Path) -> String {
+    let mut out = String::new();
+    for c in path.to_string_lossy().chars() {
+        match c {
+            '%' | '?' | '#' | ' ' => out.push_str(&format!("%{:02X}", c as u32)),
+            '\\' => out.push('/'),
+            c => out.push(c),
         }
     }
-    let schema = c"main";
-    // SAFETY: `conn.handle()` is live for this call; allocation and lengths meet
-    // sqlite3_deserialize's contract. READONLY forbids image mutation and
-    // FREEONCLOSE transfers allocation ownership to SQLite on success.
-    let result = unsafe {
-        rusqlite::ffi::sqlite3_deserialize(
-            conn.handle(),
-            schema.as_ptr(),
-            allocation,
-            deserialize_size,
-            deserialize_size,
-            rusqlite::ffi::SQLITE_DESERIALIZE_FREEONCLOSE
-                | rusqlite::ffi::SQLITE_DESERIALIZE_READONLY,
-        )
-    };
-    if result != rusqlite::ffi::SQLITE_OK {
-        // FREEONCLOSE also requires SQLite to free the buffer before returning
-        // from a failed sqlite3_deserialize call; do not free it a second time.
-        return Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(result),
-            None,
-        ));
-    }
-    Ok(())
-}
-
-fn deserialize_sizes(len: usize) -> rusqlite::Result<(u64, i64)> {
-    let allocation_size = u64::try_from(len).map_err(|_| rusqlite::Error::InvalidQuery)?;
-    let image_size = i64::try_from(len).map_err(|_| rusqlite::Error::InvalidQuery)?;
-    Ok((allocation_size, image_size))
+    out
 }
 
 fn validate_extraction_stamp(db_path: &Path, stamp: Option<String>) -> Result<()> {
@@ -1476,56 +1375,6 @@ mod tests {
         assert!(matches!(
             Store::wal_size_bytes_for_path(&invalid_db),
             Err(StoreError::InspectArtifact { .. })
-        ));
-    }
-
-    /// W5-09f: the image read into SQLite's buffer is the file's bytes, and
-    /// a file that is longer or shorter than the length read first fails the
-    /// read instead of yielding a torn image.
-    #[test]
-    fn a_database_image_is_the_files_bytes_read_once() {
-        let bytes: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
-        let image = read_image_of_len(&mut bytes.as_slice(), bytes.len()).unwrap();
-        assert_eq!(image.bytes(), bytes.as_slice());
-        let grew = read_image_of_len(&mut bytes.as_slice(), bytes.len() - 1)
-            .err()
-            .expect("a longer file fails");
-        assert_eq!(grew.to_string(), "database changed while it was read");
-        let shrank = read_image_of_len(&mut bytes.as_slice(), bytes.len() + 1)
-            .err()
-            .expect("a shorter file fails");
-        assert_eq!(shrank.kind(), std::io::ErrorKind::UnexpectedEof);
-        let dir = std::env::temp_dir().join(format!(
-            "codegraph-image-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("codegraph.db");
-        std::fs::write(&file, &bytes).unwrap();
-        assert_eq!(
-            read_database_image(&file).unwrap().bytes(),
-            std::fs::read(&file).unwrap().as_slice()
-        );
-        std::fs::remove_dir_all(&dir).ok();
-        let empty = read_image_of_len(&mut [].as_slice(), 0).unwrap();
-        let mut conn = Connection::open_in_memory().unwrap();
-        assert!(matches!(
-            deserialize_read_only(&mut conn, empty),
-            Err(rusqlite::Error::SqliteFailure(error, _))
-                if error.code == rusqlite::ErrorCode::OutOfMemory
-        ));
-    }
-
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn impossible_deserialize_size_is_rejected_before_ownership_bearing_allocation() {
-        assert!(matches!(
-            deserialize_sizes(usize::MAX),
-            Err(rusqlite::Error::InvalidQuery)
         ));
     }
 
