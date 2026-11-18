@@ -14,4 +14,4 @@ pub mod types;
 pub mod wsl;
 
 pub use errors::{CodeGraphError, Result};
-pub use index_paths::{IndexPaths, IndexPathsError};
+pub use index_paths::{IndexPaths, IndexPathsError, register_external_root, unregister_external_root};

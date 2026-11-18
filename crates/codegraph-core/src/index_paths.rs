@@ -121,6 +121,15 @@ impl IndexPaths {
 
         let project_identity = physical_identity(&project)?;
 
+        // An embedding host (Monbits) keeps the index outside the source tree.
+        if let Some(root) = external_root_for(&project) {
+            return Ok(Self {
+                project,
+                project_identity,
+                current_root: root,
+            });
+        }
+
         let directory_name = match codegraph_dir {
             None => default_directory_name(&project, crate::wsl::is_wsl_windows_drive(&project)),
             Some(_) => configured_directory_name(codegraph_dir)?,
@@ -248,6 +257,47 @@ impl IndexPaths {
     /// the daemon lifecycle layer.)
     pub fn daemon_socket(&self) -> PathBuf {
         self.current_root.join("daemon.sock")
+    }
+}
+
+// ---------------------------------------------------------------- external roots
+
+type ExternalRoots = std::sync::RwLock<std::collections::HashMap<PathBuf, PathBuf>>;
+
+fn external_roots() -> &'static ExternalRoots {
+    static ROOTS: std::sync::OnceLock<ExternalRoots> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(Default::default)
+}
+
+fn external_root_for(canonical_project: &Path) -> Option<PathBuf> {
+    external_roots().read().ok()?.get(canonical_project).cloned()
+}
+
+/// Keep `project`'s index in `root` (an absolute directory outside the project)
+/// instead of `<project>/.codegraph`, for every later [`IndexPaths::resolve`] in
+/// this process. `root` is created. Fails if either path cannot be
+/// canonicalized or `root` lies inside `project` (or is an ancestor of it).
+pub fn register_external_root(project: &Path, root: &Path) -> Result<PathBuf, IndexPathsError> {
+    let canon = |path: &Path| {
+        path.canonicalize().map_err(|source| IndexPathsError::Canonicalize { path: path.to_path_buf(), source })
+    };
+    let project = canon(project)?;
+    std::fs::create_dir_all(root).map_err(|source| IndexPathsError::Canonicalize { path: root.to_path_buf(), source })?;
+    let root = canon(root)?;
+    if root.starts_with(&project) || project.starts_with(&root) {
+        return Err(IndexPathsError::RootAlias {
+            path: root,
+            reason: "an external index root must lie outside the project".to_string(),
+        });
+    }
+    external_roots().write().expect("external roots lock").insert(project, root.clone());
+    Ok(root)
+}
+
+/// Undo [`register_external_root`]; `resolve` falls back to the project-local root.
+pub fn unregister_external_root(project: &Path) {
+    if let (Ok(project), Ok(mut roots)) = (project.canonicalize(), external_roots().write()) {
+        roots.remove(&project);
     }
 }
 
@@ -943,4 +993,20 @@ mod tests {
         assert_eq!(roots, [project.join(".codegraph")].into_iter().collect());
         let _ = std::fs::remove_dir_all(&project);
     }
+
+    #[test]
+    fn external_root_moves_every_artifact_out_of_the_project() {
+        let base = temp_dir("external");
+        let project = base.join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        let root = base.join("appdata/idx");
+        let canonical = register_external_root(&project, &root).unwrap();
+        let paths = IndexPaths::resolve(&project, None).unwrap();
+        assert_eq!(paths.current_root(), canonical);
+        assert!(!paths.current_db().starts_with(paths.project()));
+        assert!(register_external_root(&project, &project.join("x")).is_err());
+        unregister_external_root(&project);
+        assert_eq!(IndexPaths::resolve(&project, None).unwrap().current_root(), paths.project().join(".codegraph"));
+    }
+
 }
