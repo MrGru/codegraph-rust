@@ -266,15 +266,20 @@ impl IndexLease {
         if Instant::now() >= deadline {
             return Err(IndexLeaseError::TimedOut { path: lock_path });
         }
+        // The root's own parent: the project for a project-local root, the host's
+        // directory for an external one (`register_external_root`). Never assume
+        // the project, or an external root would be created inside the source tree.
+        let parent = root_path
+            .parent()
+            .expect("IndexPaths current root always has a parent");
         let project =
-            cap_std::fs::Dir::from_std_file(open_directory_no_follow(paths.project()).map_err(
+            cap_std::fs::Dir::from_std_file(open_directory_no_follow(parent).map_err(
                 |source| IndexLeaseError::CreateRoot {
-                    path: paths.project().to_path_buf(),
+                    path: parent.to_path_buf(),
                     source,
                 },
             )?);
         checkpoint(AcquireCheckpoint::ProjectRootOpened);
-        debug_assert_eq!(root_path.parent(), Some(paths.project()));
         let root_name = root_path
             .file_name()
             .expect("IndexPaths current root always has a file name");
