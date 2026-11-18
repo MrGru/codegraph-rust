@@ -477,11 +477,9 @@ impl<'store> GraphTraverser<'store> {
 
         let mut dynamic_unresolved: Vec<String> = self
             .store
-            .all_unresolved_refs()?
+            .unresolved_refs_from_node(&node.id)?
             .into_iter()
-            .filter(|r| {
-                r.from_node_id == node.id && r.reference_name.starts_with(GODOT_DYNAMIC_PREFIX)
-            })
+            .filter(|r| r.reference_name.starts_with(GODOT_DYNAMIC_PREFIX))
             .map(|r| r.reference_name)
             .collect();
         dynamic_unresolved.sort();
@@ -497,12 +495,9 @@ impl<'store> GraphTraverser<'store> {
         let binding = format!("autoload -> {file_path}");
         Ok(self
             .store
-            .nodes_by_kind(NodeKind::Constant)?
+            .nodes_by_kind_and_signature(NodeKind::Constant, &binding)?
             .into_iter()
-            .any(|n| {
-                n.language == Language::GodotProject
-                    && n.signature.as_deref() == Some(binding.as_str())
-            }))
+            .any(|n| n.language == Language::GodotProject))
     }
 
     /// Ports `getCallees` from `upstream graph/traversal.ts:275-310`.

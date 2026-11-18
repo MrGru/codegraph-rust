@@ -929,6 +929,22 @@ impl Store {
         rows.collect()
     }
 
+    /// The unresolved references made from one node (`idx_unresolved_from_node`).
+    pub fn unresolved_refs_from_node(&self, node_id: &str) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM unresolved_refs WHERE from_node_id = ? ORDER BY id")?;
+        let rows = stmt.query_map([node_id], row_to_unresolved_ref)?;
+        rows.collect()
+    }
+
+    /// Nodes of `kind` with exactly this signature.
+    pub fn nodes_by_kind_and_signature(&self, kind: NodeKind, signature: &str) -> rusqlite::Result<Vec<Node>> {
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE kind = ?1 AND signature = ?2",
+            [kind.as_str(), signature],
+        )
+    }
+
     /// Every unresolved reference of `kind`, in row order.
     pub fn unresolved_refs_of_kind(&self, kind: EdgeKind) -> rusqlite::Result<Vec<UnresolvedRef>> {
         let mut stmt = self
